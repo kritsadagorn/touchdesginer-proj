@@ -256,7 +256,7 @@ def main():
         print('[tracker] RealSense OK')
     else:
         cam       = open_webcam(selected)
-        get_frame = lambda: (get_frame_webcam(cap), None)
+        get_frame = lambda: (get_frame_webcam(cam), None)
         print('[tracker] Webcam - no depth masking')
 
     print(f"\n[tracker] Loading {MODEL_NAME} ...")
