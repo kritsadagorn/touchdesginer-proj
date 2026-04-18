@@ -1,20 +1,15 @@
 """
 topdown_tracker.py
 ------------------
-Top-down camera person position tracker using YOLOv8n
-Detects all people in frame and sends their positions via OSC
+Top-down person position tracker
+Uses Background Subtraction to remove projector background
+then finds person blobs - works even with projector interference
 
 OSC output (port 7001):
-  /persons/count     int    number of people detected
-  /persons/0/x       float  -0.5 to 0.5 (person 0, left=-0.5 right=+0.5)
-  /persons/0/y       float  -0.5 to 0.5 (person 0, top=+0.5 bottom=-0.5)
-  /persons/1/x       float  person 1 x
-  /persons/1/y       float  person 1 y
-  ... up to MAX_PERSONS
-
-TouchDesigner:
-  - OSC In CHOP port=7001
-  - channels: /persons/count, /persons/0/x, /persons/0/y, ...
+  /persons/count     int
+  /persons/0/x       float  -0.5 to 0.5
+  /persons/0/y       float  -0.5 to 0.5
+  /persons/1/x ...
 """
 
 import sys
@@ -24,14 +19,22 @@ from pythonosc import udp_client
 
 # ── config ─────────────────────────────────────────────────────────────────────
 OSC_IP      = "127.0.0.1"
-OSC_PORT    = 7001           # คนละ port กับ wrist tracker (7000)
-MODEL_NAME  = "yolov8n.pt"  # detection model (ไม่ต้อง pose)
-CONF_THRESH = 0.4
-MAX_PERSONS = 6              # track สูงสุดกี่คน
+OSC_PORT    = 7001
+MAX_PERSONS = 6
 SMOOTH      = 0.2
 
-# ── RealSense detection ────────────────────────────────────────────────────────
+# Background subtraction config
+BG_HISTORY       = 500    # frames to learn background
+BG_THRESHOLD     = 25     # sensitivity (lower = more sensitive)
+BG_LEARN_RATE    = 0.002  # how fast bg updates (0=static, 1=instant)
+
+# Blob filter
+MIN_BLOB_AREA    = 3000   # min pixel area to count as person
+MAX_BLOB_AREA    = 200000 # max pixel area (filter noise)
+
+# ── RealSense ──────────────────────────────────────────────────────────────────
 USE_REALSENSE = False
+rs_devices    = []
 try:
     import pyrealsense2 as rs
     ctx = rs.context()
@@ -39,79 +42,26 @@ try:
     if rs_devices:
         USE_REALSENSE = True
 except ImportError:
-    rs_devices = []
-
-# ── Orbbec / OpenNI2 detection ─────────────────────────────────────────────────
-USE_OPENNI = False
-try:
-    from openni import openni2
-    openni2.initialize()
-    USE_OPENNI = True
-    print("[scan] OpenNI2 initialized (Orbbec detected)")
-except Exception:
     pass
 
 
 # ── camera scanning ────────────────────────────────────────────────────────────
-def scan_webcams(max_index=6):
+def scan_webcams(max_index=8):
     found = []
-    print("[scan] Scanning for webcams...")
+    print("[scan] Scanning webcams...")
     for i in range(max_index):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         if cap.isOpened():
             ret, _ = cap.read()
             if ret:
                 found.append({'type': 'webcam', 'index': i,
-                              'name': f"Webcam index {i}",
-                              'cap': cap})
+                              'name': f"Webcam index {i}", 'cap': cap})
                 print(f"  [found] Webcam index {i}")
             else:
                 cap.release()
         else:
             cap.release()
     return found
-
-
-class OrbbecCamera:
-    """Orbbec via OpenNI2 - color + depth"""
-    def __init__(self):
-        from openni import openni2, utils
-        self.device     = openni2.Device.open_any()
-        self.color_stream = self.device.create_color_stream()
-        self.depth_stream = self.device.create_depth_stream()
-        self.color_stream.set_video_mode(
-            openni2.c_api.OniVideoMode(
-                pixelFormat=openni2.PIXEL_FORMAT_RGB888,
-                resolutionX=1280, resolutionY=720, fps=30))
-        self.depth_stream.set_video_mode(
-            openni2.c_api.OniVideoMode(
-                pixelFormat=openni2.PIXEL_FORMAT_DEPTH_1_MM,
-                resolutionX=640, resolutionY=480, fps=30))
-        self.color_stream.start()
-        self.depth_stream.start()
-        print("[Orbbec] Color + Depth streams started")
-
-    def get_frame(self):
-        try:
-            import numpy as np
-            cf = self.color_stream.read_frame()
-            df = self.depth_stream.read_frame()
-            color_data = cf.get_buffer_as_uint8()
-            depth_data = df.get_buffer_as_uint16()
-            color = np.frombuffer(color_data, dtype=np.uint8).reshape(720, 1280, 3)
-            color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-            depth = np.frombuffer(depth_data, dtype=np.uint16).reshape(480, 640)
-            depth = cv2.resize(depth, (1280, 720))
-            return color, depth
-        except Exception as e:
-            print(f"[WARN] Orbbec frame error: {e}")
-            return None, None
-
-    def stop(self):
-        self.color_stream.stop()
-        self.depth_stream.stop()
-        from openni import openni2
-        openni2.unload()
 
 
 def scan_all_cameras():
@@ -123,9 +73,6 @@ def scan_all_cameras():
             cameras.append({'type': 'realsense', 'serial': serial,
                             'name': f"RealSense {name} (S/N: {serial})"})
             print(f"  [found] RealSense: {name}")
-    if USE_OPENNI:
-        cameras.append({'type': 'orbbec', 'name': 'Orbbec Depth Camera (OpenNI2)'})
-        print("  [found] Orbbec via OpenNI2")
     cameras.extend(scan_webcams())
     return cameras
 
@@ -134,23 +81,18 @@ def select_camera(cameras):
     if not cameras:
         print("[ERROR] No cameras found")
         sys.exit(1)
-
-    print("\n" + "="*50)
+    print("\n" + "="*52)
     print(" Available cameras:")
-    print("="*50)
+    print("="*52)
     for i, cam in enumerate(cameras):
         print(f"  {i+1}. {cam['name']}")
-    print("="*50)
-
+    print("="*52)
     while True:
         try:
-            choice = input(f"\nSelect top-down camera [1-{len(cameras)}]: ").strip()
-            idx = int(choice) - 1
+            idx = int(input(f"\nSelect top-down camera [1-{len(cameras)}]: ").strip()) - 1
             if 0 <= idx < len(cameras):
                 return cameras[idx]
-            print(f"  Enter 1-{len(cameras)}")
         except (ValueError, KeyboardInterrupt):
-            print("\n[EXIT]")
             sys.exit(0)
 
 
@@ -164,6 +106,15 @@ def open_realsense(serial):
     return pipeline
 
 
+def get_frame_realsense(pipeline):
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=3000)
+        f = frames.get_color_frame()
+        return np.asanyarray(f.get_data()) if f else None
+    except RuntimeError:
+        return None
+
+
 def open_webcam(selected):
     if 'cap' in selected and selected['cap'].isOpened():
         cap = selected['cap']
@@ -175,30 +126,10 @@ def open_webcam(selected):
     return cap
 
 
-def get_frame_realsense(pipeline):
-    try:
-        frames = pipeline.wait_for_frames(timeout_ms=3000)
-        f = frames.get_color_frame()
-        if not f:
-            return None
-        frame = np.asanyarray(f.get_data())
-        # brightness enhancement
-        lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        l     = clahe.apply(l)
-        lab   = cv2.merge((l, a, b))
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    except RuntimeError as e:
-        print(f"[WARN] RealSense frame timeout: {e}")
-        return None
-
-
 def get_frame_webcam(cap):
     ret, frame = cap.read()
     if not ret or frame is None:
         return None
-    # force 16:9 crop then resize
     h, w = frame.shape[:2]
     target_h = int(w * 9 / 16)
     if target_h > h:
@@ -212,9 +143,8 @@ def get_frame_webcam(cap):
     return cv2.resize(frame, (1280, 720))
 
 
-# ── smoothing per person slot ──────────────────────────────────────────────────
+# ── smoothing ──────────────────────────────────────────────────────────────────
 smooth_positions = [[0.0, 0.0] for _ in range(MAX_PERSONS)]
-
 
 def smooth_pos(slot, nx, ny):
     smooth_positions[slot][0] = smooth_positions[slot][0] * SMOOTH + nx * (1 - SMOOTH)
@@ -224,16 +154,13 @@ def smooth_pos(slot, nx, ny):
 
 # ── main ───────────────────────────────────────────────────────────────────────
 def main():
-    from ultralytics import YOLO
-
-    print("\n" + "="*50)
-    print(" Top-Down Person Tracker")
+    print("\n" + "="*52)
+    print(" Top-Down Person Tracker (Background Subtraction)")
     print(f" OSC -> {OSC_IP}:{OSC_PORT}")
-    print("="*50)
+    print("="*52)
 
     print("\n[scan] Looking for cameras...")
     cameras = scan_all_cameras()
-
     if not cameras:
         print("[ERROR] No cameras found")
         input("Press Enter to exit...")
@@ -242,86 +169,93 @@ def main():
     selected = select_camera(cameras)
     print(f"\n[tracker] Using: {selected['name']}")
 
-    use_depth = False
+    # release unused webcams
+    for cam_info in cameras:
+        if cam_info is not selected and cam_info.get('type') == 'webcam':
+            c = cam_info.get('cap')
+            if c and c.isOpened():
+                c.release()
 
-    if selected['type'] == 'orbbec':
-        orbbec_cam = OrbbecCamera()
-        use_depth  = True
-        get_frame  = lambda: orbbec_cam.get_frame()
-        print('[tracker] Orbbec depth masking ON')
-    elif selected['type'] == 'realsense':
+    if selected['type'] == 'realsense':
         cam       = open_realsense(selected['serial'])
-        use_depth = False
-        get_frame = lambda: (get_frame_realsense(cam), None)
-        print('[tracker] RealSense OK')
+        get_frame = lambda: get_frame_realsense(cam)
     else:
         cam       = open_webcam(selected)
-        get_frame = lambda: (get_frame_webcam(cam), None)
-        print('[tracker] Webcam - no depth masking')
-
-    print(f"\n[tracker] Loading {MODEL_NAME} ...")
-    model = YOLO(MODEL_NAME)
-    print("[tracker] Model loaded")
+        get_frame = lambda: get_frame_webcam(cam)
 
     osc = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
     print(f"[tracker] OSC ready -> {OSC_IP}:{OSC_PORT}")
-    print(f"[tracker] Max persons: {MAX_PERSONS}")
-    print("[tracker] Running — press Q to quit\n")
+
+    # ── background subtractor ──────────────────────────────────────────────────
+    bg_sub = cv2.createBackgroundSubtractorMOG2(
+        history=BG_HISTORY,
+        varThreshold=BG_THRESHOLD,
+        detectShadows=False
+    )
+
+    print("\n" + "="*52)
+    print(" CONTROLS:")
+    print("  SPACE = capture static background (freeze BG learning)")
+    print("  R     = reset background (re-learn)")
+    print("  +/-   = increase/decrease sensitivity")
+    print("  Q     = quit")
+    print("="*52)
+    print("\n[tracker] Learning background... move out of frame first!")
+    print("[tracker] Press SPACE when background is ready\n")
+
+    bg_frozen   = False
+    static_bg   = None
+    threshold   = BG_THRESHOLD
+    learn_rate  = BG_LEARN_RATE
+
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,  5))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
 
     while True:
-        result = get_frame()
-        frame = result if not isinstance(result, tuple) else result[0]
+        frame = get_frame()
         if frame is None:
             continue
 
         h, w = frame.shape[:2]
+        display = frame.copy()
 
-        color, depth = frame if isinstance(frame, tuple) else (frame, None)
-        if color is None:
-            continue
-        frame = color
+        # ── compute foreground mask ────────────────────────────────────────────
+        if bg_frozen and static_bg is not None:
+            # static background subtraction
+            diff   = cv2.absdiff(frame, static_bg)
+            gray   = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            _, fg_mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        else:
+            # adaptive MOG2
+            fg_mask = bg_sub.apply(frame, learningRate=learn_rate)
 
-        # depth masking (ถ้ามี depth stream)
-        if use_depth and depth is not None:
-            depth_m = depth.astype(np.float32) / 1000.0
-            mask    = ((depth_m >= 0.3) & (depth_m <= 2.4)).astype(np.uint8)
-            kernel  = np.ones((15,15), np.uint8)
-            mask    = cv2.dilate(mask, kernel, iterations=2)
-            frame   = frame.copy()
-            frame[mask == 0] = 0
+        # morphology: remove noise, fill holes
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel_open)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close)
 
-        # brightness enhancement (CLAHE)
-        lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        l     = clahe.apply(l)
-        lab   = cv2.merge((l, a, b))
-        frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        # detect persons only (class 0)
-        results = model(frame, verbose=False, conf=CONF_THRESH, classes=[0], imgsz=320)
+        # ── find blobs ─────────────────────────────────────────────────────────
+        contours, _ = cv2.findContours(
+            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         persons = []
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # centroid
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-                # normalize to -0.5..0.5
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if MIN_BLOB_AREA < area < MAX_BLOB_AREA:
+                M  = cv2.moments(cnt)
+                if M['m00'] == 0:
+                    continue
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
                 nx =  (cx / w) - 0.5
                 ny = -(cy / h) + 0.5
-                persons.append((nx, ny, int(x1), int(y1), int(x2), int(y2)))
+                persons.append((nx, ny, cx, cy, cnt))
 
-        # sort left to right for consistent slot assignment
+        # sort left to right
         persons.sort(key=lambda p: p[0])
         count = min(len(persons), MAX_PERSONS)
 
-        # send OSC
+        # ── send OSC ───────────────────────────────────────────────────────────
         osc.send_message("/persons/count", count)
-
         for i in range(MAX_PERSONS):
             if i < count:
                 nx, ny = persons[i][0], persons[i][1]
@@ -329,35 +263,67 @@ def main():
                 osc.send_message(f"/persons/{i}/x", float(sx))
                 osc.send_message(f"/persons/{i}/y", float(sy))
             else:
-                # send 0 for empty slots
                 osc.send_message(f"/persons/{i}/x", 0.0)
                 osc.send_message(f"/persons/{i}/y", 0.0)
 
-        # draw overlay
-        for i, (nx, ny, x1, y1, x2, y2) in enumerate(persons[:MAX_PERSONS]):
+        # ── draw overlay ───────────────────────────────────────────────────────
+        # fg mask overlay (semi-transparent)
+        mask_color = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
+        mask_color[:,:,0] = 0  # only green/red channels
+        display = cv2.addWeighted(display, 0.7, mask_color, 0.3, 0)
+
+        for i, (nx, ny, cx, cy, cnt) in enumerate(persons[:MAX_PERSONS]):
             sx, sy = smooth_positions[i]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            cv2.circle(frame, (cx, cy), 8, (0, 255, 255), -1)
-            cv2.putText(frame, f"P{i} ({sx:+.2f},{sy:+.2f})",
-                        (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (0, 255, 0), 2)
+            cv2.drawContours(display, [cnt], -1, (0, 255, 0), 2)
+            cv2.circle(display, (cx, cy), 10, (0, 255, 255), -1)
+            cv2.putText(display, f"P{i} ({sx:+.2f},{sy:+.2f})",
+                        (cx+12, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2)
 
-        cv2.putText(frame, f"Persons: {count}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (255, 255, 0), 2)
+        status = "BG: FROZEN" if bg_frozen else f"BG: LEARNING (rate={learn_rate:.3f})"
+        cv2.putText(display, f"Persons: {count}  |  {status}  |  thr={threshold}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+        cv2.putText(display, "SPACE=freeze BG  R=reset  +/-=sensitivity  Q=quit",
+                    (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-        cv2.imshow(f"Top-Down Tracker  [Q=quit]", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # mask thumbnail (top-right)
+        thumb = cv2.resize(fg_mask, (320, 180))
+        thumb_bgr = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
+        display[0:180, w-320:w] = thumb_bgr
+        cv2.putText(display, "FG mask", (w-310, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
+        cv2.imshow("Top-Down Tracker  [Q=quit]", display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord(' '):
+            # freeze background
+            static_bg  = frame.copy()
+            bg_frozen  = True
+            learn_rate = 0
+            print("[tracker] Background FROZEN")
+        elif key == ord('r'):
+            # reset and re-learn
+            bg_sub     = cv2.createBackgroundSubtractorMOG2(
+                history=BG_HISTORY, varThreshold=threshold, detectShadows=False)
+            static_bg  = None
+            bg_frozen  = False
+            learn_rate = BG_LEARN_RATE
+            print("[tracker] Background RESET - learning...")
+        elif key == ord('+') or key == ord('='):
+            threshold = max(5, threshold - 5)
+            print(f"[tracker] Threshold = {threshold}")
+        elif key == ord('-'):
+            threshold = min(100, threshold + 5)
+            print(f"[tracker] Threshold = {threshold}")
 
     cv2.destroyAllWindows()
     if selected['type'] == 'realsense':
         cam.stop()
     else:
         cam.release()
-
     print("[tracker] Stopped")
 
 
