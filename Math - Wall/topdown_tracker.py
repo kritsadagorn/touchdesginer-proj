@@ -242,12 +242,22 @@ def main():
     selected = select_camera(cameras)
     print(f"\n[tracker] Using: {selected['name']}")
 
-    if selected['type'] == 'realsense':
+    use_depth = False
+
+    if selected['type'] == 'orbbec':
+        orbbec_cam = OrbbecCamera()
+        use_depth  = True
+        get_frame  = lambda: orbbec_cam.get_frame()
+        print('[tracker] Orbbec depth masking ON')
+    elif selected['type'] == 'realsense':
         cam       = open_realsense(selected['serial'])
-        get_frame = lambda: get_frame_realsense(cam)
+        use_depth = False
+        get_frame = lambda: (get_frame_realsense(cam), None)
+        print('[tracker] RealSense OK')
     else:
         cam       = open_webcam(selected)
-        get_frame = lambda: get_frame_webcam(cam)
+        get_frame = lambda: (get_frame_webcam(cap), None)
+        print('[tracker] Webcam - no depth masking')
 
     print(f"\n[tracker] Loading {MODEL_NAME} ...")
     model = YOLO(MODEL_NAME)
