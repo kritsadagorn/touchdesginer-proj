@@ -230,7 +230,9 @@ def main():
 
         # ── background subtraction (static only) ──────────────────────────────
         if static_bg is not None:
-            diff  = cv2.absdiff(frame, static_bg)
+            frame_blur = cv2.GaussianBlur(frame, (21, 21), 0)
+            bg_blur    = cv2.GaussianBlur(static_bg, (21, 21), 0)
+            diff  = cv2.absdiff(frame_blur, bg_blur)
             gray  = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, fg = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
             fg    = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kernel_open)

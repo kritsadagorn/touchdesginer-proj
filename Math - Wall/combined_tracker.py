@@ -41,9 +41,11 @@ MAX_BLOB_AREA = 150000
 BG_THRESHOLD  = 30
 
 # Wrist raise threshold (y > ค่านี้ = ยกมือ, 0=กลางจอ, 0.2=ยกขึ้น)
-HAND_RAISE_Y  = 0.15
+HAND_RAISE_Y  = 0.15   # ไม่ใช้แล้ว (เก็บไว้)
+JUMP_THRESHOLD = 0.08  # nose y ต้องขึ้นมากกว่านี้จาก baseline = กระโดด
 
 # YOLO keypoints
+KP_NOSE        = 0
 KP_RIGHT_WRIST = 10
 KP_LEFT_WRIST  = 9
 
@@ -171,12 +173,15 @@ def main():
     print("SPACE=freeze BG  R=reset  +/-=sensitivity  D=debug  Q=quit\n")
 
     # state
-    static_bg   = None
-    threshold   = BG_THRESHOLD
-    zones       = dict(DEFAULT_ZONES)
-    frame_count = 0
+    static_bg    = None
+    threshold    = BG_THRESHOLD
+    zones        = dict(DEFAULT_ZONES)
+    frame_count  = 0
     last_results = []
     smooth_wrist = {'right': [0.0, 0.0], 'left': [0.0, 0.0]}
+    nose_baseline = None   # y position ตอนยืนปกติ
+    nose_smooth   = 0.0
+    NOSE_SMOOTH   = 0.3
 
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
@@ -198,6 +203,7 @@ def main():
                                  classes=[0], imgsz=320)
 
         right_detected = False
+        jump_detected  = False
 
         for res in last_results:
             if res.keypoints is None or res.keypoints.conf is None:
@@ -209,38 +215,47 @@ def main():
             pk = kpts[0]
             pc = confs[0]
 
-            for side, kp_idx, col in [
-                ('right', KP_RIGHT_WRIST, (0, 255, 0)),
-            ]:
-                if pc[kp_idx] < CONF_THRESH:
-                    continue
-                px, py = pk[kp_idx]
-                nx =  (px / w) - 0.5
-                ny = -(py / h) + 0.5
-                smooth_wrist[side][0] = smooth_wrist[side][0] * SMOOTH_WRIST + nx * (1 - SMOOTH_WRIST)
-                smooth_wrist[side][1] = smooth_wrist[side][1] * SMOOTH_WRIST + ny * (1 - SMOOTH_WRIST)
-                sy = smooth_wrist[side][1]
+            # ── nose / head jump detection ─────────────────────────────────
+            if pc[KP_NOSE] >= CONF_THRESH:
+                nx_nose =  (pk[KP_NOSE][0] / w) - 0.5
+                ny_nose = -(pk[KP_NOSE][1] / h) + 0.5  # ขึ้น = บวก
+                nose_smooth = nose_smooth * NOSE_SMOOTH + ny_nose * (1 - NOSE_SMOOTH)
 
-                osc.send_message(f"/wrist/{side}/x",      float(smooth_wrist[side][0]))
-                osc.send_message(f"/wrist/{side}/y",      float(sy))
-                osc.send_message(f"/wrist/{side}/active", 1)
+                # calibrate baseline (ค่าเฉลี่ย y ตอนยืนปกติ)
+                if nose_baseline is None:
+                    nose_baseline = nose_smooth
+                else:
+                    # update baseline ช้าๆ เฉพาะตอนไม่กระโดด
+                    diff = nose_smooth - nose_baseline
+                    if diff < JUMP_THRESHOLD:
+                        nose_baseline = nose_baseline * 0.99 + nose_smooth * 0.01
 
-                label = 'R' if side == 'right' else 'L'
-                raised = '↑' if sy > HAND_RAISE_Y else ''
-                cv2.circle(display, (int(px), int(py)), 12, col, -1)
-                cv2.putText(display, f"{label}{raised} y={sy:+.2f}",
-                            (int(px)+14, int(py)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+                jump_diff = nose_smooth - nose_baseline
+                jump_detected = jump_diff > JUMP_THRESHOLD
 
-                right_detected = True
+                osc.send_message("/jump/active", 1 if jump_detected else 0)
+                osc.send_message("/jump/y",      float(jump_diff))
+
+                col_nose = (0, 255, 0) if jump_detected else (200, 200, 200)
+                cv2.circle(display, (int(pk[KP_NOSE][0]), int(pk[KP_NOSE][1])), 10, col_nose, -1)
+                jump_str = f"JUMP! +{jump_diff:.2f}" if jump_detected else f"y={jump_diff:+.2f}"
+                cv2.putText(display, jump_str,
+                            (int(pk[KP_NOSE][0])+14, int(pk[KP_NOSE][1])),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, col_nose, 2)
+            else:
+                osc.send_message("/jump/active", 0)
+
             break
 
-        if not right_detected:
-            osc.send_message("/wrist/right/active", 0)
+        if not jump_detected:
+            osc.send_message("/jump/active", 0)
 
         # ── background subtraction ─────────────────────────────────────────────
         if static_bg is not None:
-            diff = cv2.absdiff(frame, static_bg)
+            # blur ก่อน subtract เพื่อลด noise จาก projector
+            frame_blur = cv2.GaussianBlur(frame, (21, 21), 0)
+            bg_blur    = cv2.GaussianBlur(static_bg, (21, 21), 0)
+            diff = cv2.absdiff(frame_blur, bg_blur)
             gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, fg = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
             fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kernel_open)
