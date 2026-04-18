@@ -4,6 +4,7 @@ yolo_tracker.py
 YOLO Pose wrist tracker - tracks both hands of 1 person
 Sends normalized x,y to TouchDesigner via OSC
 
+๊Update : Image Size , Infer
 OSC output (port 7000):
   /wrist/right/x      float  -0.5 to 0.5
   /wrist/right/y      float  -0.5 to 0.5
@@ -103,7 +104,7 @@ def open_realsense(serial):
     pipeline = rs.pipeline()
     config   = rs.config()
     config.enable_device(serial)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
     pipeline.start(config)
     return pipeline
 
@@ -175,6 +176,8 @@ def main():
         'right': [0.0, 0.0],
         'left':  [0.0, 0.0],
     }
+    frame_count = 0
+    INFER_EVERY = 2   # run YOLO every N frames (1=every frame, 2=skip 1)
 
     def apply_smooth(hand, nx, ny):
         smooth[hand][0] = smooth[hand][0] * SMOOTH + nx * (1 - SMOOTH)
@@ -188,7 +191,16 @@ def main():
 
         h, w = frame.shape[:2]
 
-        results = model(frame, verbose=False, conf=CONF_THRESH, classes=[0])
+        frame_count += 1
+        if frame_count % INFER_EVERY != 0:
+            # show frame without inference
+            cv2.imshow(f"YOLO Wrist Tracker  [Q=quit]", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
+
+        results = model(frame, verbose=False, conf=CONF_THRESH,
+                        classes=[0], imgsz=320)
 
         right_detected = False
         left_detected  = False
