@@ -38,6 +38,11 @@ MIN_BLOB_AREA = 2000
 MAX_BLOB_AREA = 150000
 BG_THRESHOLD  = 30
 
+# ROI - เฉพาะส่วนล่างของภาพ (คนจะอยู่ตรงนี้)
+# 0.0 = บนสุด, 1.0 = ล่างสุด
+ROI_Y_START = 0.3   # เริ่มที่ 30% จากบน
+ROI_Y_END   = 1.0   # ถึงล่างสุด
+
 KP_NOSE = 0
 
 DEFAULT_ZONES = {
@@ -373,6 +378,16 @@ def main():
             fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel_close)
         else:
             fg = np.zeros((h, w), dtype=np.uint8)
+
+        # apply ROI mask - เฉพาะส่วนล่าง
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        roi_y1 = int(h * ROI_Y_START)
+        roi_y2 = int(h * ROI_Y_END)
+        roi_mask[roi_y1:roi_y2, :] = 255
+        fg = cv2.bitwise_and(fg, roi_mask)
+
+        # draw ROI line
+        cv2.line(display, (0, roi_y1), (w, roi_y1), (255, 255, 0), 1)
 
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid_blobs = []
