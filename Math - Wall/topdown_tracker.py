@@ -1,15 +1,23 @@
 """
 topdown_tracker.py
 ------------------
-Top-down person position tracker
-Uses Background Subtraction to remove projector background
-then finds person blobs - works even with projector interference
+Wall/Floor person zone detector using static background subtraction
+Detects which ZONE (1/2/3) a person is standing in
+Sends OSC to TouchDesigner for level selection
 
 OSC output (port 7001):
-  /persons/count     int
-  /persons/0/x       float  -0.5 to 0.5
-  /persons/0/y       float  -0.5 to 0.5
-  /persons/1/x ...
+  /zone/1/active   int  1=person detected in zone 1, 0=not
+  /zone/2/active   int  1=person detected in zone 2, 0=not
+  /zone/3/active   int  1=person detected in zone 3, 0=not
+  /persons/count   int  total persons detected
+
+Controls:
+  SPACE = capture static background (must be empty frame)
+  R     = reset background
+  1/2/3 = toggle zone edit mode (drag to set zone)
+  +/-   = adjust sensitivity
+  D     = debug blob areas
+  Q     = quit
 """
 
 import sys
@@ -18,24 +26,27 @@ import numpy as np
 from pythonosc import udp_client
 
 # ── config ─────────────────────────────────────────────────────────────────────
-OSC_IP      = "127.0.0.1"
-OSC_PORT    = 7001
-MAX_PERSONS = 6
-SMOOTH      = 0.2
+OSC_IP    = "127.0.0.1"
+OSC_PORT  = 7001
+SMOOTH    = 0.15  # smoothing for zone activity (0=instant 1=freeze)
 
-# Background subtraction config
-BG_HISTORY       = 500    # frames to learn background
-BG_THRESHOLD     = 25     # sensitivity (lower = more sensitive)
-BG_LEARN_RATE    = 0.002  # how fast bg updates (0=static, 1=instant)
+# Blob filter - ปรับตามขนาดคนในภาพ
+MIN_BLOB_AREA = 2000
+MAX_BLOB_AREA = 150000
 
-# Blob filter
-MIN_BLOB_AREA    = 5000   # min pixel area to count as person
-MAX_BLOB_AREA    = 80000  # max pixel area (filter noise + shadows)
+# Default zones (x1, y1, x2, y2) normalized 0.0-1.0
+# แบ่ง 3 แนวตั้ง (ซ้าย กลาง ขวา)
+DEFAULT_ZONES = {
+    1: (0.00, 0.00, 0.33, 1.00),
+    2: (0.33, 0.00, 0.67, 1.00),
+    3: (0.67, 0.00, 1.00, 1.00),
+}
 
-# ROI - ถ้าอยากจำกัดพื้นที่ให้ detect เฉพาะส่วน (0.0-1.0)
-# ปล่อยเป็น None เพื่อใช้ทั้งภาพ
-# ROI_X1, ROI_Y1 = top-left  ROI_X2, ROI_Y2 = bottom-right
-ROI = None  # เช่น (0.1, 0.1, 0.9, 0.9) หรือ None
+ZONE_COLORS = {
+    1: (255, 80,  80),   # blue
+    2: (80,  255, 80),   # green
+    3: (80,  80,  255),  # red
+}
 
 # ── RealSense ──────────────────────────────────────────────────────────────────
 USE_REALSENSE = False
@@ -50,7 +61,7 @@ except ImportError:
     pass
 
 
-# ── camera scanning ────────────────────────────────────────────────────────────
+# ── camera ─────────────────────────────────────────────────────────────────────
 def scan_webcams(max_index=8):
     found = []
     print("[scan] Scanning webcams...")
@@ -94,14 +105,13 @@ def select_camera(cameras):
     print("="*52)
     while True:
         try:
-            idx = int(input(f"\nSelect top-down camera [1-{len(cameras)}]: ").strip()) - 1
+            idx = int(input(f"\nSelect camera [1-{len(cameras)}]: ").strip()) - 1
             if 0 <= idx < len(cameras):
                 return cameras[idx]
         except (ValueError, KeyboardInterrupt):
             sys.exit(0)
 
 
-# ── camera open ────────────────────────────────────────────────────────────────
 def open_realsense(serial):
     pipeline = rs.pipeline()
     config   = rs.config()
@@ -144,23 +154,25 @@ def get_frame_webcam(cap):
         target_w = w
     x0 = (w - target_w) // 2
     y0 = (h - target_h) // 2
-    frame = frame[y0:y0+target_h, x0:x0+target_w]
-    return cv2.resize(frame, (1280, 720))
+    return cv2.resize(frame[y0:y0+target_h, x0:x0+target_w], (1280, 720))
 
 
-# ── smoothing ──────────────────────────────────────────────────────────────────
-smooth_positions = [[0.0, 0.0] for _ in range(MAX_PERSONS)]
+# ── zone helpers ───────────────────────────────────────────────────────────────
+def zone_px(zone, w, h):
+    """Convert normalized zone to pixel coords"""
+    z = zone
+    return int(z[0]*w), int(z[1]*h), int(z[2]*w), int(z[3]*h)
 
-def smooth_pos(slot, nx, ny):
-    smooth_positions[slot][0] = smooth_positions[slot][0] * SMOOTH + nx * (1 - SMOOTH)
-    smooth_positions[slot][1] = smooth_positions[slot][1] * SMOOTH + ny * (1 - SMOOTH)
-    return smooth_positions[slot][0], smooth_positions[slot][1]
+
+def blob_in_zone(cx, cy, zone, w, h):
+    x1, y1, x2, y2 = zone_px(zone, w, h)
+    return x1 <= cx <= x2 and y1 <= cy <= y2
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
 def main():
     print("\n" + "="*52)
-    print(" Top-Down Person Tracker (Background Subtraction)")
+    print(" Zone Detector (Static Background Subtraction)")
     print(f" OSC -> {OSC_IP}:{OSC_PORT}")
     print("="*52)
 
@@ -174,7 +186,6 @@ def main():
     selected = select_camera(cameras)
     print(f"\n[tracker] Using: {selected['name']}")
 
-    # release unused webcams
     for cam_info in cameras:
         if cam_info is not selected and cam_info.get('type') == 'webcam':
             c = cam_info.get('cap')
@@ -189,33 +200,25 @@ def main():
         get_frame = lambda: get_frame_webcam(cam)
 
     osc = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
-    print(f"[tracker] OSC ready -> {OSC_IP}:{OSC_PORT}")
+    print(f"[tracker] OSC -> {OSC_IP}:{OSC_PORT}")
 
-    # ── background subtractor ──────────────────────────────────────────────────
-    bg_sub = cv2.createBackgroundSubtractorMOG2(
-        history=BG_HISTORY,
-        varThreshold=BG_THRESHOLD,
-        detectShadows=False
-    )
+    zones     = dict(DEFAULT_ZONES)   # mutable copy
+    static_bg = None
+    threshold = 30
+    zone_active = {1: 0.0, 2: 0.0, 3: 0.0}  # smoothed activity
+
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
 
     print("\n" + "="*52)
     print(" CONTROLS:")
-    print("  SPACE = capture static background (freeze BG learning)")
-    print("  R     = reset background (re-learn)")
-    print("  +/-   = increase/decrease sensitivity")
+    print("  SPACE = capture background (clear the frame first!)")
+    print("  R     = reset background")
+    print("  +/-   = adjust sensitivity")
+    print("  D     = print blob areas for tuning")
     print("  Q     = quit")
     print("="*52)
-    print("\n[tracker] Learning background... move out of frame first!")
-    print("[tracker] Press SPACE when background is ready\n")
-
-    bg_frozen   = False
-    static_bg   = None
-    threshold   = BG_THRESHOLD
-    learn_rate  = BG_LEARN_RATE
-
-    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
+    print("\n[tracker] Clear the frame then press SPACE to capture background\n")
 
     while True:
         frame = get_frame()
@@ -225,121 +228,107 @@ def main():
         h, w = frame.shape[:2]
         display = frame.copy()
 
-        # ── compute foreground mask ────────────────────────────────────────────
-        if bg_frozen and static_bg is not None:
-            # static background subtraction
-            diff   = cv2.absdiff(frame, static_bg)
-            gray   = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            _, fg_mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        # ── background subtraction (static only) ──────────────────────────────
+        if static_bg is not None:
+            diff  = cv2.absdiff(frame, static_bg)
+            gray  = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            _, fg = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+            fg    = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kernel_open)
+            fg    = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel_close)
         else:
-            # adaptive MOG2
-            fg_mask = bg_sub.apply(frame, learningRate=learn_rate)
-
-        # morphology: remove noise, fill holes
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel_open)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close)
-        fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=1)
-
-        # apply ROI mask if defined
-        if ROI is not None:
-            roi_mask = np.zeros_like(fg_mask)
-            x1 = int(ROI[0] * w)
-            y1 = int(ROI[1] * h)
-            x2 = int(ROI[2] * w)
-            y2 = int(ROI[3] * h)
-            roi_mask[y1:y2, x1:x2] = 255
-            fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
+            fg = np.zeros((h, w), dtype=np.uint8)
 
         # ── find blobs ─────────────────────────────────────────────────────────
-        contours, _ = cv2.findContours(
-            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        persons = []
+        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        valid_blobs = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if MIN_BLOB_AREA < area < MAX_BLOB_AREA:
-                M  = cv2.moments(cnt)
+                M = cv2.moments(cnt)
                 if M['m00'] == 0:
                     continue
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
-                nx =  (cx / w) - 0.5
-                ny = -(cy / h) + 0.5
-                persons.append((nx, ny, cx, cy, cnt))
+                valid_blobs.append((cx, cy, cnt, area))
 
-        # sort left to right
-        persons.sort(key=lambda p: p[0])
-        count = min(len(persons), MAX_PERSONS)
+        # ── check zones ────────────────────────────────────────────────────────
+        zone_hit = {1: False, 2: False, 3: False}
+        for cx, cy, cnt, area in valid_blobs:
+            for zid, zone in zones.items():
+                if blob_in_zone(cx, cy, zone, w, h):
+                    zone_hit[zid] = True
 
-        # ── send OSC ───────────────────────────────────────────────────────────
-        osc.send_message("/persons/count", count)
-        for i in range(MAX_PERSONS):
-            if i < count:
-                nx, ny = persons[i][0], persons[i][1]
-                sx, sy = smooth_pos(i, nx, ny)
-                osc.send_message(f"/persons/{i}/x", float(sx))
-                osc.send_message(f"/persons/{i}/y", float(sy))
-            else:
-                osc.send_message(f"/persons/{i}/x", 0.0)
-                osc.send_message(f"/persons/{i}/y", 0.0)
+        # smooth zone activity
+        for zid in [1, 2, 3]:
+            target = 1.0 if zone_hit[zid] else 0.0
+            zone_active[zid] = zone_active[zid] * SMOOTH + target * (1 - SMOOTH)
 
-        # ── draw overlay ───────────────────────────────────────────────────────
-        # fg mask overlay (semi-transparent)
-        mask_color = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
-        mask_color[:,:,0] = 0  # only green/red channels
-        display = cv2.addWeighted(display, 0.7, mask_color, 0.3, 0)
+        # send OSC
+        osc.send_message("/persons/count", len(valid_blobs))
+        for zid in [1, 2, 3]:
+            active = 1 if zone_active[zid] > 0.5 else 0
+            osc.send_message(f"/zone/{zid}/active", active)
 
-        for i, (nx, ny, cx, cy, cnt) in enumerate(persons[:MAX_PERSONS]):
-            sx, sy = smooth_positions[i]
-            cv2.drawContours(display, [cnt], -1, (0, 255, 0), 2)
-            cv2.circle(display, (cx, cy), 10, (0, 255, 255), -1)
-            cv2.putText(display, f"P{i} ({sx:+.2f},{sy:+.2f})",
-                        (cx+12, cy), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0, 255, 0), 2)
+        # ── draw zones ─────────────────────────────────────────────────────────
+        for zid, zone in zones.items():
+            x1, y1, x2, y2 = zone_px(zone, w, h)
+            color  = ZONE_COLORS[zid]
+            active = zone_active[zid] > 0.5
+            alpha  = 0.35 if active else 0.1
+            overlay = display.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+            display = cv2.addWeighted(overlay, alpha, display, 1-alpha, 0)
+            thick = 3 if active else 1
+            cv2.rectangle(display, (x1, y1), (x2, y2), color, thick)
+            label = f"L{zid}  {'ACTIVE' if active else ''}"
+            cv2.putText(display, label,
+                        (x1+10, y1+40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
-        status = "BG: FROZEN" if bg_frozen else f"BG: LEARNING (rate={learn_rate:.3f})"
-        cv2.putText(display, f"Persons: {count}  |  {status}  |  thr={threshold}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
-        cv2.putText(display, "SPACE=freeze BG  R=reset  +/-=sensitivity  Q=quit",
+        # draw blobs
+        for cx, cy, cnt, area in valid_blobs:
+            cv2.drawContours(display, [cnt], -1, (0, 255, 255), 2)
+            cv2.circle(display, (cx, cy), 8, (0, 255, 255), -1)
+
+        # status bar
+        bg_status = "BG: READY" if static_bg is not None else "BG: NOT SET (press SPACE)"
+        cv2.putText(display,
+                    f"{bg_status}  |  thr={threshold}  |  blobs={len(valid_blobs)}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (0, 255, 0) if static_bg is not None else (0, 100, 255), 2)
+        cv2.putText(display,
+                    "SPACE=capture BG  R=reset  +/-=sensitivity  D=debug  Q=quit",
                     (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-        # mask thumbnail (top-right)
-        thumb = cv2.resize(fg_mask, (320, 180))
-        thumb_bgr = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
-        display[0:180, w-320:w] = thumb_bgr
+        # fg mask thumbnail
+        thumb = cv2.resize(fg, (320, 180))
+        display[0:180, w-320:w] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
         cv2.putText(display, "FG mask", (w-310, 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,255), 1)
 
-        cv2.imshow("Top-Down Tracker  [Q=quit]", display)
+        cv2.imshow("Zone Detector  [Q=quit]", display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('d'):
-            # print blob areas for tuning MIN/MAX_BLOB_AREA
-            areas = sorted([cv2.contourArea(c) for c in contours], reverse=True)
-            print(f'[debug] All blob areas: {areas[:10]}')
-            print(f'[debug] MIN_BLOB_AREA={MIN_BLOB_AREA} MAX_BLOB_AREA={MAX_BLOB_AREA}')
         elif key == ord(' '):
-            # freeze background
-            static_bg  = frame.copy()
-            bg_frozen  = True
-            learn_rate = 0
-            print("[tracker] Background FROZEN")
+            static_bg = frame.copy()
+            print("[tracker] Background captured!")
         elif key == ord('r'):
-            # reset and re-learn
-            bg_sub     = cv2.createBackgroundSubtractorMOG2(
-                history=BG_HISTORY, varThreshold=threshold, detectShadows=False)
-            static_bg  = None
-            bg_frozen  = False
-            learn_rate = BG_LEARN_RATE
-            print("[tracker] Background RESET - learning...")
-        elif key == ord('+') or key == ord('='):
+            static_bg = None
+            zone_active = {1: 0.0, 2: 0.0, 3: 0.0}
+            print("[tracker] Background RESET")
+        elif key in (ord('+'), ord('=')):
             threshold = max(5, threshold - 5)
             print(f"[tracker] Threshold = {threshold}")
         elif key == ord('-'):
             threshold = min(100, threshold + 5)
             print(f"[tracker] Threshold = {threshold}")
+        elif key == ord('d'):
+            areas = sorted([cv2.contourArea(c) for c in contours], reverse=True)
+            print(f"[debug] Blob areas: {[int(a) for a in areas[:10]]}")
+            print(f"[debug] MIN={MIN_BLOB_AREA} MAX={MAX_BLOB_AREA} thr={threshold}")
 
     cv2.destroyAllWindows()
     if selected['type'] == 'realsense':
