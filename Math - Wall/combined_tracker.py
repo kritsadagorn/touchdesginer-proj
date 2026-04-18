@@ -34,7 +34,7 @@ INFER_EVERY    = 2
 JUMP_THRESHOLD = 0.08
 NOSE_SMOOTH    = 0.3
 
-MIN_BLOB_AREA = 2000
+MIN_BLOB_AREA = 8000
 MAX_BLOB_AREA = 150000
 BG_THRESHOLD  = 30
 
@@ -447,7 +447,10 @@ def main():
         elif key == ord('r'):
             static_bg     = None
             nose_baseline = None
-            print("[tracker] Reset")
+            print("[tracker] Reset BG + baseline")
+        elif key == ord('b'):
+            nose_baseline = None
+            print("[tracker] Baseline RESET - stand still for 2 seconds")
         elif key in (ord('+'), ord('=')):
             threshold = max(5, threshold - 5)
             print(f"[tracker] Threshold = {threshold}")
