@@ -104,7 +104,7 @@ def open_realsense(serial):
     pipeline = rs.pipeline()
     config   = rs.config()
     config.enable_device(serial)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
     pipeline.start(config)
     return pipeline
 
@@ -114,8 +114,9 @@ def open_webcam(selected):
         cap = selected['cap']
     else:
         cap = cv2.VideoCapture(selected['index'], cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     return cap
 
 
@@ -123,7 +124,16 @@ def get_frame_realsense(pipeline):
     try:
         frames = pipeline.wait_for_frames(timeout_ms=3000)
         f = frames.get_color_frame()
-        return np.asanyarray(f.get_data()) if f else None
+        if not f:
+            return None
+        frame = np.asanyarray(f.get_data())
+        # brightness enhancement
+        lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l     = clahe.apply(l)
+        lab   = cv2.merge((l, a, b))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     except RuntimeError as e:
         print(f"[WARN] RealSense frame timeout: {e}")
         return None
@@ -131,7 +141,20 @@ def get_frame_realsense(pipeline):
 
 def get_frame_webcam(cap):
     ret, frame = cap.read()
-    return frame if ret else None
+    if not ret or frame is None:
+        return None
+    # force 16:9 crop then resize
+    h, w = frame.shape[:2]
+    target_h = int(w * 9 / 16)
+    if target_h > h:
+        target_h = h
+        target_w = int(h * 16 / 9)
+    else:
+        target_w = w
+    x0 = (w - target_w) // 2
+    y0 = (h - target_h) // 2
+    frame = frame[y0:y0+target_h, x0:x0+target_w]
+    return cv2.resize(frame, (1280, 720))
 
 
 # ── smoothing per person slot ──────────────────────────────────────────────────
@@ -187,8 +210,16 @@ def main():
 
         h, w = frame.shape[:2]
 
+        # brightness enhancement (CLAHE on L channel)
+        lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l     = clahe.apply(l)
+        lab   = cv2.merge((l, a, b))
+        frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
         # detect persons only (class 0)
-        results = model(frame, verbose=False, conf=CONF_THRESH, classes=[0])
+        results = model(frame, verbose=False, conf=CONF_THRESH, classes=[0], imgsz=320)
 
         persons = []
         for r in results:
