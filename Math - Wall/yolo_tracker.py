@@ -120,9 +120,13 @@ def open_webcam(selected):
 
 
 def get_frame_realsense(pipeline):
-    frames = pipeline.wait_for_frames()
-    f = frames.get_color_frame()
-    return np.asanyarray(f.get_data()) if f else None
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=3000)
+        f = frames.get_color_frame()
+        return np.asanyarray(f.get_data()) if f else None
+    except RuntimeError as e:
+        print(f"[WARN] RealSense frame timeout: {e}")
+        return None
 
 
 def get_frame_webcam(cap):
