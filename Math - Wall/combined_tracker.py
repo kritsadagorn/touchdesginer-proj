@@ -62,6 +62,22 @@ ZONE_COLORS = {
 }
 
 
+# ── RealSense ──────────────────────────────────────────────────────────────────
+USE_REALSENSE = False
+rs_devices    = []
+try:
+    import pyrealsense2 as rs
+    ctx = rs.context()
+    rs_devices = list(ctx.query_devices())
+    if rs_devices:
+        USE_REALSENSE = True
+except ImportError:
+    pass
+
+# Depth config
+DEPTH_MIN = 0.3   # เมตร
+DEPTH_MAX = 2.4   # เมตร - ปรับตามห้อง
+
 # ── camera scanning ────────────────────────────────────────────────────────────
 def scan_webcams(max_index=8):
     found = []
@@ -79,6 +95,60 @@ def scan_webcams(max_index=8):
         else:
             cap.release()
     return found
+
+
+def scan_all_cameras():
+    cameras = []
+    if USE_REALSENSE:
+        for dev in rs_devices:
+            name   = dev.get_info(rs.camera_info.name)
+            serial = dev.get_info(rs.camera_info.serial_number)
+            cameras.append({'type': 'realsense', 'serial': serial,
+                            'name': f"RealSense {name} (S/N: {serial})"})
+            print(f"  [found] RealSense: {name}")
+    cameras.extend(scan_webcams())
+    return cameras
+
+
+class RealSenseCamera:
+    def __init__(self, serial):
+        self.pipeline = rs.pipeline()
+        self.align    = None
+        config = rs.config()
+        config.enable_device(serial)
+        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+        self.pipeline.start(config)
+        self.align = rs.align(rs.stream.color)
+        print("[RealSense] Color + Depth streams started")
+
+    def get_frame(self):
+        try:
+            frames  = self.pipeline.wait_for_frames(timeout_ms=3000)
+            aligned = self.align.process(frames)
+            cf = aligned.get_color_frame()
+            df = aligned.get_depth_frame()
+            if not cf or not df:
+                return None, None
+            color = np.asanyarray(cf.get_data())
+            depth = np.asanyarray(df.get_data())  # uint16 mm
+            return color, depth
+        except RuntimeError as e:
+            print(f"[WARN] RealSense: {e}")
+            return None, None
+
+    def stop(self):
+        self.pipeline.stop()
+
+
+def apply_depth_mask(color, depth):
+    depth_m = depth.astype(np.float32) / 1000.0
+    mask    = ((depth_m >= DEPTH_MIN) & (depth_m <= DEPTH_MAX)).astype(np.uint8)
+    kernel  = np.ones((15,15), np.uint8)
+    mask    = cv2.dilate(mask, kernel, iterations=2)
+    masked  = color.copy()
+    masked[mask == 0] = 0
+    return masked
 
 
 def select_camera(cameras):
@@ -189,12 +259,18 @@ def main():
     print("[tracker] Clear the frame then press SPACE to capture background")
 
     while True:
-        frame = get_frame_webcam(cam)
-        if frame is None:
+        color, depth = get_color_depth()
+        if color is None:
             continue
 
+        # apply depth mask first if available
+        if use_depth and depth is not None:
+            frame = apply_depth_mask(color, depth)
+        else:
+            frame = color
+
         h, w = frame.shape[:2]
-        display = frame.copy()
+        display = color.copy()  # always show unmasked for display
 
         # ── YOLO pose (every N frames) ─────────────────────────────────────────
         frame_count += 1
@@ -338,7 +414,16 @@ def main():
             print(f"[debug] Blob areas: {[int(a) for a in areas[:8]]}")
 
     cv2.destroyAllWindows()
-    cam.release()
+    if use_depth and depth_src is not None:
+        try:
+            if hasattr(depth_src, 'stop'):
+                depth_src.stop()
+        except:
+            pass
+    try:
+        cam.release()
+    except:
+        pass
     print("[tracker] Stopped")
 
 
