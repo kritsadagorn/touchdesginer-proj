@@ -1,22 +1,20 @@
 """
 combined_tracker.py
 -------------------
-Zone detection + Wrist raise detection in ONE script, ONE camera
-Camera is behind/side of person (like D435 setup)
+Zone detection + Jump detection in ONE script, ONE camera
 
-OSC output (port 7000 and 7001 combined into port 7000):
-  /zone/1/active      int  1=person in zone 1
-  /zone/2/active      int  1=person in zone 2
-  /zone/3/active      int  1=person in zone 3
-  /wrist/right/y      float  wrist y position
-  /wrist/right/active int    1=detected
-  /wrist/left/y       float
-  /wrist/left/active  int
+OSC output (port 7000):
+  /zone/1/active   int  1=person in zone 1
+  /zone/2/active   int  1=person in zone 2
+  /zone/3/active   int  1=person in zone 3
+  /jump/active     int  1=jumping
+  /jump/y          float jump height
+  /persons/count   int  blob count
 
 Controls:
-  SPACE = capture static background
+  SPACE = capture static background (clear frame first!)
   R     = reset background
-  +/-   = adjust BG sensitivity
+  +/-   = adjust sensitivity (max 255)
   D     = debug blob areas
   Q     = quit
 """
@@ -28,28 +26,20 @@ from pythonosc import udp_client
 
 # ── config ─────────────────────────────────────────────────────────────────────
 OSC_IP    = "127.0.0.1"
-OSC_PORT  = 7000          # ส่งทุกอย่างออก port เดียว
+OSC_PORT  = 7000
 
-MODEL_NAME   = "yolov8n-pose.pt"
-CONF_THRESH  = 0.4
-SMOOTH_WRIST = 0.3
-INFER_EVERY  = 2
+MODEL_NAME     = "yolov8n-pose.pt"
+CONF_THRESH    = 0.4
+INFER_EVERY    = 2
+JUMP_THRESHOLD = 0.08
+NOSE_SMOOTH    = 0.3
 
-# Background subtraction
 MIN_BLOB_AREA = 2000
 MAX_BLOB_AREA = 150000
 BG_THRESHOLD  = 30
 
-# Wrist raise threshold (y > ค่านี้ = ยกมือ, 0=กลางจอ, 0.2=ยกขึ้น)
-HAND_RAISE_Y  = 0.15   # ไม่ใช้แล้ว (เก็บไว้)
-JUMP_THRESHOLD = 0.08  # nose y ต้องขึ้นมากกว่านี้จาก baseline = กระโดด
+KP_NOSE = 0
 
-# YOLO keypoints
-KP_NOSE        = 0
-KP_RIGHT_WRIST = 10
-KP_LEFT_WRIST  = 9
-
-# Zones (normalized 0.0-1.0) - แบ่งตามแนวนอน ซ้าย/กลาง/ขวา
 DEFAULT_ZONES = {
     1: (0.00, 0.00, 0.33, 1.00),
     2: (0.33, 0.00, 0.67, 1.00),
@@ -60,7 +50,6 @@ ZONE_COLORS = {
     2: (80,  255, 80),
     3: (80,  80,  255),
 }
-
 
 # ── RealSense ──────────────────────────────────────────────────────────────────
 USE_REALSENSE = False
@@ -74,11 +63,11 @@ try:
 except ImportError:
     pass
 
-# Depth config
-DEPTH_MIN = 0.3   # เมตร
-DEPTH_MAX = 2.4   # เมตร - ปรับตามห้อง
+DEPTH_MIN = 0.3
+DEPTH_MAX = 2.4
 
-# ── camera scanning ────────────────────────────────────────────────────────────
+
+# ── camera ─────────────────────────────────────────────────────────────────────
 def scan_webcams(max_index=8):
     found = []
     print("[scan] Scanning webcams...")
@@ -110,47 +99,6 @@ def scan_all_cameras():
     return cameras
 
 
-class RealSenseCamera:
-    def __init__(self, serial):
-        self.pipeline = rs.pipeline()
-        self.align    = None
-        config = rs.config()
-        config.enable_device(serial)
-        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
-        self.pipeline.start(config)
-        self.align = rs.align(rs.stream.color)
-        print("[RealSense] Color + Depth streams started")
-
-    def get_frame(self):
-        try:
-            frames  = self.pipeline.wait_for_frames(timeout_ms=3000)
-            aligned = self.align.process(frames)
-            cf = aligned.get_color_frame()
-            df = aligned.get_depth_frame()
-            if not cf or not df:
-                return None, None
-            color = np.asanyarray(cf.get_data())
-            depth = np.asanyarray(df.get_data())  # uint16 mm
-            return color, depth
-        except RuntimeError as e:
-            print(f"[WARN] RealSense: {e}")
-            return None, None
-
-    def stop(self):
-        self.pipeline.stop()
-
-
-def apply_depth_mask(color, depth):
-    depth_m = depth.astype(np.float32) / 1000.0
-    mask    = ((depth_m >= DEPTH_MIN) & (depth_m <= DEPTH_MAX)).astype(np.uint8)
-    kernel  = np.ones((15,15), np.uint8)
-    mask    = cv2.dilate(mask, kernel, iterations=2)
-    masked  = color.copy()
-    masked[mask == 0] = 0
-    return masked
-
-
 def select_camera(cameras):
     if not cameras:
         print("[ERROR] No cameras found")
@@ -168,6 +116,34 @@ def select_camera(cameras):
                 return cameras[idx]
         except (ValueError, KeyboardInterrupt):
             sys.exit(0)
+
+
+class RealSenseCamera:
+    def __init__(self, serial):
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_device(serial)
+        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+        self.pipeline.start(config)
+        self.align = rs.align(rs.stream.color)
+        print("[RealSense] Color + Depth streams started")
+
+    def get_frame(self):
+        try:
+            frames  = self.pipeline.wait_for_frames(timeout_ms=3000)
+            aligned = self.align.process(frames)
+            cf = aligned.get_color_frame()
+            df = aligned.get_depth_frame()
+            if not cf or not df:
+                return None, None
+            return np.asanyarray(cf.get_data()), np.asanyarray(df.get_data())
+        except RuntimeError as e:
+            print(f"[WARN] RealSense: {e}")
+            return None, None
+
+    def stop(self):
+        self.pipeline.stop()
 
 
 def open_webcam(selected):
@@ -197,7 +173,16 @@ def get_frame_webcam(cap):
     return cv2.resize(frame[y0:y0+target_h, x0:x0+target_w], (1280, 720))
 
 
-# ── zone helper ────────────────────────────────────────────────────────────────
+def apply_depth_mask(color, depth):
+    depth_m = depth.astype(np.float32) / 1000.0
+    mask    = ((depth_m >= DEPTH_MIN) & (depth_m <= DEPTH_MAX)).astype(np.uint8)
+    kernel  = np.ones((15, 15), np.uint8)
+    mask    = cv2.dilate(mask, kernel, iterations=2)
+    masked  = color.copy()
+    masked[mask == 0] = 0
+    return masked
+
+
 def zone_px(zone, w, h):
     return int(zone[0]*w), int(zone[1]*h), int(zone[2]*w), int(zone[3]*h)
 
@@ -212,28 +197,90 @@ def main():
     from ultralytics import YOLO
 
     print("\n" + "="*52)
-    print(" Combined Tracker (Zone + Wrist) - Single Camera")
+    print(" Combined Tracker (Zone + Jump)")
     print(f" OSC -> {OSC_IP}:{OSC_PORT}")
     print("="*52)
 
-    cameras = scan_webcams()
+    cameras = scan_all_cameras()
     if not cameras:
-        print("[ERROR] No webcams found")
+        print("[ERROR] No cameras found")
         input("Press Enter...")
         sys.exit(1)
 
-    # release all first, then re-open selected
     selected = select_camera(cameras)
+
+    # release unused cams
     for c in cameras:
-        if c is not selected:
+        if c is not selected and c.get('type') == 'webcam':
             cap_c = c.get('cap')
             if cap_c and cap_c.isOpened():
                 cap_c.release()
 
-    cam = open_webcam(selected)
-    print(f"\n[tracker] Camera: {selected['name']}")
+    # ── open camera ────────────────────────────────────────────────────────────
+    use_depth  = False
+    rs_cam_obj = None
+    webcam_cap = None
 
-    print(f"[tracker] Loading {MODEL_NAME} ...")
+    if selected['type'] == 'realsense':
+        try:
+            rs_cam_obj = RealSenseCamera(selected['serial'])
+            tc, td = rs_cam_obj.get_frame()
+            if tc is None:
+                raise RuntimeError("No frame from RealSense")
+            use_depth = True
+            print("[tracker] RealSense depth masking ON")
+
+            def get_color_depth():
+                return rs_cam_obj.get_frame()
+
+        except RuntimeError as e:
+            print(f"[WARN] RealSense SDK failed: {e}")
+            print("[WARN] Trying depth-only + webcam color...")
+            try:
+                serial = selected['serial']
+                dep_pipeline = rs.pipeline()
+                dep_config   = rs.config()
+                dep_config.enable_device(serial)
+                dep_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                dep_pipeline.start(dep_config)
+                dep_pipeline.wait_for_frames(timeout_ms=3000)
+                print("[tracker] RealSense depth-only OK")
+                cidx = int(input("Enter webcam index for D435 color (e.g. 2): ").strip())
+                webcam_cap = open_webcam({'index': cidx})
+                use_depth  = True
+
+                def get_color_depth():
+                    color = get_frame_webcam(webcam_cap)
+                    try:
+                        dframes = dep_pipeline.wait_for_frames(timeout_ms=1000)
+                        df = dframes.get_depth_frame()
+                        if df:
+                            raw = np.asanyarray(df.get_data())
+                            return color, cv2.resize(raw, (1280, 720),
+                                                     interpolation=cv2.INTER_NEAREST)
+                    except:
+                        pass
+                    return color, None
+
+            except Exception as e2:
+                print(f"[WARN] Depth-only failed: {e2} -> RGB only")
+                cidx = int(input("Enter webcam index: ").strip())
+                webcam_cap = open_webcam({'index': cidx})
+                use_depth  = False
+
+                def get_color_depth():
+                    return get_frame_webcam(webcam_cap), None
+    else:
+        webcam_cap = open_webcam(selected)
+        use_depth  = False
+
+        def get_color_depth():
+            return get_frame_webcam(webcam_cap), None
+
+    print(f"\n[tracker] Camera: {selected['name']}")
+    print(f"[tracker] Depth mask: {'ON' if use_depth else 'OFF'}")
+
+    print(f"\n[tracker] Loading {MODEL_NAME} ...")
     model = YOLO(MODEL_NAME)
     print("[tracker] Model loaded")
 
@@ -241,45 +288,39 @@ def main():
     print(f"[tracker] OSC -> {OSC_IP}:{OSC_PORT}")
     print("[tracker] Running — press Q to quit\n")
     print("SPACE=freeze BG  R=reset  +/-=sensitivity  D=debug  Q=quit\n")
+    print("[tracker] Clear the frame then press SPACE to capture background")
 
-    # state
-    static_bg    = None
-    threshold    = BG_THRESHOLD
-    zones        = dict(DEFAULT_ZONES)
-    frame_count  = 0
-    last_results = []
-    smooth_wrist = {'right': [0.0, 0.0], 'left': [0.0, 0.0]}
-    nose_baseline = None   # y position ตอนยืนปกติ
+    static_bg     = None
+    threshold     = BG_THRESHOLD
+    frame_count   = 0
+    last_results  = []
+    nose_baseline = None
     nose_smooth   = 0.0
-    NOSE_SMOOTH   = 0.3
 
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-
-    print("[tracker] Clear the frame then press SPACE to capture background")
 
     while True:
         color, depth = get_color_depth()
         if color is None:
             continue
 
-        # apply depth mask first if available
+        # depth mask
         if use_depth and depth is not None:
             frame = apply_depth_mask(color, depth)
         else:
             frame = color
 
         h, w = frame.shape[:2]
-        display = color.copy()  # always show unmasked for display
+        display = color.copy()
 
-        # ── YOLO pose (every N frames) ─────────────────────────────────────────
+        # ── YOLO pose ──────────────────────────────────────────────────────────
         frame_count += 1
         if frame_count % INFER_EVERY == 0:
             last_results = model(frame, verbose=False, conf=CONF_THRESH,
                                  classes=[0], imgsz=320)
 
-        right_detected = False
-        jump_detected  = False
+        jump_detected = False
 
         for res in last_results:
             if res.keypoints is None or res.keypoints.conf is None:
@@ -291,17 +332,13 @@ def main():
             pk = kpts[0]
             pc = confs[0]
 
-            # ── nose / head jump detection ─────────────────────────────────
             if pc[KP_NOSE] >= CONF_THRESH:
-                nx_nose =  (pk[KP_NOSE][0] / w) - 0.5
-                ny_nose = -(pk[KP_NOSE][1] / h) + 0.5  # ขึ้น = บวก
+                ny_nose = -(pk[KP_NOSE][1] / h) + 0.5
                 nose_smooth = nose_smooth * NOSE_SMOOTH + ny_nose * (1 - NOSE_SMOOTH)
 
-                # calibrate baseline (ค่าเฉลี่ย y ตอนยืนปกติ)
                 if nose_baseline is None:
                     nose_baseline = nose_smooth
                 else:
-                    # update baseline ช้าๆ เฉพาะตอนไม่กระโดด
                     diff = nose_smooth - nose_baseline
                     if diff < JUMP_THRESHOLD:
                         nose_baseline = nose_baseline * 0.99 + nose_smooth * 0.01
@@ -314,13 +351,12 @@ def main():
 
                 col_nose = (0, 255, 0) if jump_detected else (200, 200, 200)
                 cv2.circle(display, (int(pk[KP_NOSE][0]), int(pk[KP_NOSE][1])), 10, col_nose, -1)
-                jump_str = f"JUMP! +{jump_diff:.2f}" if jump_detected else f"y={jump_diff:+.2f}"
-                cv2.putText(display, jump_str,
+                cv2.putText(display,
+                            f"JUMP! +{jump_diff:.2f}" if jump_detected else f"y={jump_diff:+.2f}",
                             (int(pk[KP_NOSE][0])+14, int(pk[KP_NOSE][1])),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, col_nose, 2)
             else:
                 osc.send_message("/jump/active", 0)
-
             break
 
         if not jump_detected:
@@ -328,19 +364,17 @@ def main():
 
         # ── background subtraction ─────────────────────────────────────────────
         if static_bg is not None:
-            # blur ก่อน subtract เพื่อลด noise จาก projector
-            frame_blur = cv2.GaussianBlur(frame, (21, 21), 0)
-            bg_blur    = cv2.GaussianBlur(static_bg, (21, 21), 0)
-            diff = cv2.absdiff(frame_blur, bg_blur)
-            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            fb = cv2.GaussianBlur(frame,     (21, 21), 0)
+            bb = cv2.GaussianBlur(static_bg, (21, 21), 0)
+            diff2 = cv2.absdiff(fb, bb)
+            gray  = cv2.cvtColor(diff2, cv2.COLOR_BGR2GRAY)
             _, fg = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
             fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kernel_open)
             fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel_close)
         else:
             fg = np.zeros((h, w), dtype=np.uint8)
 
-        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid_blobs = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -355,7 +389,7 @@ def main():
         # ── zone detection ─────────────────────────────────────────────────────
         zone_hit = {1: False, 2: False, 3: False}
         for cx, cy, cnt in valid_blobs:
-            for zid, zone in zones.items():
+            for zid, zone in DEFAULT_ZONES.items():
                 if blob_in_zone(cx, cy, zone, w, h):
                     zone_hit[zid] = True
             cv2.drawContours(display, [cnt], -1, (0, 255, 255), 2)
@@ -366,31 +400,26 @@ def main():
             osc.send_message(f"/zone/{zid}/active", 1 if zone_hit[zid] else 0)
 
         # ── draw zones ─────────────────────────────────────────────────────────
-        for zid, zone in zones.items():
+        for zid, zone in DEFAULT_ZONES.items():
             x1, y1, x2, y2 = zone_px(zone, w, h)
-            color  = ZONE_COLORS[zid]
+            col    = ZONE_COLORS[zid]
             active = zone_hit[zid]
-            alpha  = 0.3 if active else 0.08
-            overlay = display.copy()
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-            display = cv2.addWeighted(overlay, alpha, display, 1-alpha, 0)
-            cv2.rectangle(display, (x1, y1), (x2, y2), color, 3 if active else 1)
+            ov = display.copy()
+            cv2.rectangle(ov, (x1, y1), (x2, y2), col, -1)
+            display = cv2.addWeighted(ov, 0.3 if active else 0.08, display, 1-(0.3 if active else 0.08), 0)
+            cv2.rectangle(display, (x1, y1), (x2, y2), col, 3 if active else 1)
             cv2.putText(display, f"L{zid} {'ACTIVE' if active else ''}",
-                        (x1+10, y1+40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                        (x1+10, y1+40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2)
 
         # status
         bg_ok = static_bg is not None
         cv2.putText(display,
-                    f"{'BG:OK' if bg_ok else 'BG:NOT SET (press SPACE)'}  thr={threshold}  blobs={len(valid_blobs)}",
+                    f"{'BG:OK' if bg_ok else 'NO BG - press SPACE'}  thr={threshold}  blobs={len(valid_blobs)}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                     (0,255,0) if bg_ok else (0,100,255), 2)
 
-        # fg thumbnail
         thumb = cv2.resize(fg, (320, 180))
         display[0:180, w-320:w] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
-        cv2.putText(display, "FG mask", (w-310, 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,255), 1)
 
         cv2.imshow("Combined Tracker  [Q=quit]", display)
 
@@ -401,8 +430,9 @@ def main():
             static_bg = frame.copy()
             print("[tracker] Background captured!")
         elif key == ord('r'):
-            static_bg = None
-            print("[tracker] Background RESET")
+            static_bg     = None
+            nose_baseline = None
+            print("[tracker] Reset")
         elif key in (ord('+'), ord('=')):
             threshold = max(5, threshold - 5)
             print(f"[tracker] Threshold = {threshold}")
@@ -414,16 +444,10 @@ def main():
             print(f"[debug] Blob areas: {[int(a) for a in areas[:8]]}")
 
     cv2.destroyAllWindows()
-    if use_depth and depth_src is not None:
-        try:
-            if hasattr(depth_src, 'stop'):
-                depth_src.stop()
-        except:
-            pass
-    try:
-        cam.release()
-    except:
-        pass
+    if rs_cam_obj:
+        rs_cam_obj.stop()
+    if webcam_cap:
+        webcam_cap.release()
     print("[tracker] Stopped")
 
 
