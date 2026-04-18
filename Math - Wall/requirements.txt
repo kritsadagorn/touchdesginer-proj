@@ -3,3 +3,4 @@ pyrealsense2
 python-osc
 opencv-python
 numpy
+openni

@@ -62,6 +62,48 @@ def scan_webcams(max_index=6):
     return found
 
 
+class OrbbecCamera:
+    """Orbbec via OpenNI2 - color + depth"""
+    def __init__(self):
+        from openni import openni2, utils
+        self.device     = openni2.Device.open_any()
+        self.color_stream = self.device.create_color_stream()
+        self.depth_stream = self.device.create_depth_stream()
+        self.color_stream.set_video_mode(
+            openni2.c_api.OniVideoMode(
+                pixelFormat=openni2.PIXEL_FORMAT_RGB888,
+                resolutionX=1280, resolutionY=720, fps=30))
+        self.depth_stream.set_video_mode(
+            openni2.c_api.OniVideoMode(
+                pixelFormat=openni2.PIXEL_FORMAT_DEPTH_1_MM,
+                resolutionX=640, resolutionY=480, fps=30))
+        self.color_stream.start()
+        self.depth_stream.start()
+        print("[Orbbec] Color + Depth streams started")
+
+    def get_frame(self):
+        try:
+            import numpy as np
+            cf = self.color_stream.read_frame()
+            df = self.depth_stream.read_frame()
+            color_data = cf.get_buffer_as_uint8()
+            depth_data = df.get_buffer_as_uint16()
+            color = np.frombuffer(color_data, dtype=np.uint8).reshape(720, 1280, 3)
+            color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+            depth = np.frombuffer(depth_data, dtype=np.uint16).reshape(480, 640)
+            depth = cv2.resize(depth, (1280, 720))
+            return color, depth
+        except Exception as e:
+            print(f"[WARN] Orbbec frame error: {e}")
+            return None, None
+
+    def stop(self):
+        self.color_stream.stop()
+        self.depth_stream.stop()
+        from openni import openni2
+        openni2.unload()
+
+
 def scan_all_cameras():
     cameras = []
     if USE_REALSENSE:
@@ -71,6 +113,9 @@ def scan_all_cameras():
             cameras.append({'type': 'realsense', 'serial': serial,
                             'name': f"RealSense {name} (S/N: {serial})"})
             print(f"  [found] RealSense: {name}")
+    if USE_OPENNI:
+        cameras.append({'type': 'orbbec', 'name': 'Orbbec Depth Camera (OpenNI2)'})
+        print("  [found] Orbbec via OpenNI2")
     cameras.extend(scan_webcams())
     return cameras
 
@@ -204,13 +249,28 @@ def main():
     print("[tracker] Running — press Q to quit\n")
 
     while True:
-        frame = get_frame()
+        result = get_frame()
+        frame = result if not isinstance(result, tuple) else result[0]
         if frame is None:
             continue
 
         h, w = frame.shape[:2]
 
-        # brightness enhancement (CLAHE on L channel)
+        color, depth = frame if isinstance(frame, tuple) else (frame, None)
+        if color is None:
+            continue
+        frame = color
+
+        # depth masking (ถ้ามี depth stream)
+        if use_depth and depth is not None:
+            depth_m = depth.astype(np.float32) / 1000.0
+            mask    = ((depth_m >= 0.3) & (depth_m <= 2.4)).astype(np.uint8)
+            kernel  = np.ones((15,15), np.uint8)
+            mask    = cv2.dilate(mask, kernel, iterations=2)
+            frame   = frame.copy()
+            frame[mask == 0] = 0
+
+        # brightness enhancement (CLAHE)
         lab   = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
