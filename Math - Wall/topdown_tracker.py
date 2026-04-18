@@ -29,8 +29,13 @@ BG_THRESHOLD     = 25     # sensitivity (lower = more sensitive)
 BG_LEARN_RATE    = 0.002  # how fast bg updates (0=static, 1=instant)
 
 # Blob filter
-MIN_BLOB_AREA    = 3000   # min pixel area to count as person
-MAX_BLOB_AREA    = 200000 # max pixel area (filter noise)
+MIN_BLOB_AREA    = 5000   # min pixel area to count as person
+MAX_BLOB_AREA    = 80000  # max pixel area (filter noise + shadows)
+
+# ROI - ถ้าอยากจำกัดพื้นที่ให้ detect เฉพาะส่วน (0.0-1.0)
+# ปล่อยเป็น None เพื่อใช้ทั้งภาพ
+# ROI_X1, ROI_Y1 = top-left  ROI_X2, ROI_Y2 = bottom-right
+ROI = None  # เช่น (0.1, 0.1, 0.9, 0.9) หรือ None
 
 # ── RealSense ──────────────────────────────────────────────────────────────────
 USE_REALSENSE = False
@@ -208,8 +213,9 @@ def main():
     threshold   = BG_THRESHOLD
     learn_rate  = BG_LEARN_RATE
 
-    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,  5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
 
     while True:
         frame = get_frame()
@@ -232,6 +238,17 @@ def main():
         # morphology: remove noise, fill holes
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel_open)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close)
+        fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=1)
+
+        # apply ROI mask if defined
+        if ROI is not None:
+            roi_mask = np.zeros_like(fg_mask)
+            x1 = int(ROI[0] * w)
+            y1 = int(ROI[1] * h)
+            x2 = int(ROI[2] * w)
+            y2 = int(ROI[3] * h)
+            roi_mask[y1:y2, x1:x2] = 255
+            fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
 
         # ── find blobs ─────────────────────────────────────────────────────────
         contours, _ = cv2.findContours(
@@ -298,6 +315,11 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        elif key == ord('d'):
+            # print blob areas for tuning MIN/MAX_BLOB_AREA
+            areas = sorted([cv2.contourArea(c) for c in contours], reverse=True)
+            print(f'[debug] All blob areas: {areas[:10]}')
+            print(f'[debug] MIN_BLOB_AREA={MIN_BLOB_AREA} MAX_BLOB_AREA={MAX_BLOB_AREA}')
         elif key == ord(' '):
             # freeze background
             static_bg  = frame.copy()
