@@ -4,7 +4,6 @@ yolo_tracker.py
 YOLO Pose wrist tracker - tracks both hands of 1 person
 Sends normalized x,y to TouchDesigner via OSC
 
-๊Update : Image Size , Infer
 OSC output (port 7000):
   /wrist/right/x      float  -0.5 to 0.5
   /wrist/right/y      float  -0.5 to 0.5
@@ -132,7 +131,20 @@ def get_frame_realsense(pipeline):
 
 def get_frame_webcam(cap):
     ret, frame = cap.read()
-    return frame if ret else None
+    if not ret or frame is None:
+        return None
+    # force 16:9 by cropping center
+    h, w = frame.shape[:2]
+    target_w = w
+    target_h = int(w * 9 / 16)
+    if target_h > h:
+        target_h = h
+        target_w = int(h * 16 / 9)
+    x0 = (w - target_w) // 2
+    y0 = (h - target_h) // 2
+    frame = frame[y0:y0+target_h, x0:x0+target_w]
+    frame = cv2.resize(frame, (1280, 720))
+    return frame
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
