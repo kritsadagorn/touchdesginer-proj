@@ -198,7 +198,6 @@ def main():
                                  classes=[0], imgsz=320)
 
         right_detected = False
-        left_detected  = False
 
         for res in last_results:
             if res.keypoints is None or res.keypoints.conf is None:
@@ -212,7 +211,6 @@ def main():
 
             for side, kp_idx, col in [
                 ('right', KP_RIGHT_WRIST, (0, 255, 0)),
-                ('left',  KP_LEFT_WRIST,  (0, 100, 255)),
             ]:
                 if pc[kp_idx] < CONF_THRESH:
                     continue
@@ -234,14 +232,11 @@ def main():
                             (int(px)+14, int(py)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
 
-                if side == 'right': right_detected = True
-                else:               left_detected  = True
+                right_detected = True
             break
 
         if not right_detected:
             osc.send_message("/wrist/right/active", 0)
-        if not left_detected:
-            osc.send_message("/wrist/left/active",  0)
 
         # ── background subtraction ─────────────────────────────────────────────
         if static_bg is not None:
