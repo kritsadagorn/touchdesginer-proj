@@ -41,6 +41,16 @@ try:
 except ImportError:
     rs_devices = []
 
+# ── Orbbec / OpenNI2 detection ─────────────────────────────────────────────────
+USE_OPENNI = False
+try:
+    from openni import openni2
+    openni2.initialize()
+    USE_OPENNI = True
+    print("[scan] OpenNI2 initialized (Orbbec detected)")
+except Exception:
+    pass
+
 
 # ── camera scanning ────────────────────────────────────────────────────────────
 def scan_webcams(max_index=6):

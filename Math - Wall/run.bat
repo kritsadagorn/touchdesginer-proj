@@ -10,16 +10,18 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-pip show ultralytics >nul 2>&1
+echo [setup] Checking and installing packages...
+pip install ultralytics pyrealsense2 python-osc opencv-python numpy openni --quiet
 if errorlevel 1 (
-    echo [setup] Installing packages...
-    pip install -r requirements.txt
-    if errorlevel 1 (
-        echo [ERROR] Install failed
-        pause & exit /b 1
-    )
-    echo [setup] Done
+    echo [ERROR] Install failed - trying one by one...
+    pip install ultralytics
+    pip install pyrealsense2
+    pip install python-osc
+    pip install opencv-python
+    pip install numpy
+    pip install openni
 )
+echo [setup] Done
 
 :menu
 echo.
