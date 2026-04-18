@@ -456,7 +456,9 @@ def main():
             print(f"[tracker] Threshold = {threshold}")
         elif key == ord('d'):
             areas = sorted([cv2.contourArea(c) for c in contours], reverse=True)
-            print(f"[debug] Blob areas: {[int(a) for a in areas[:8]]}")
+            print(f"[debug] Blob areas (top 8): {[int(a) for a in areas[:8]]}")
+            print(f"[debug] Total blobs: {len(contours)}  Valid: {len(valid_blobs)}")
+            print(f"[debug] MIN_BLOB_AREA={MIN_BLOB_AREA}  MAX_BLOB_AREA={MAX_BLOB_AREA}")
 
     cv2.destroyAllWindows()
     if rs_cam_obj:
