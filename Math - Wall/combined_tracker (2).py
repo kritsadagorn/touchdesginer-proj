@@ -316,7 +316,7 @@ def main():
             threshold = max(5, threshold - 5)
             print(f"[tracker] Threshold = {threshold}")
         elif key == ord('-'):
-            threshold = min(100, threshold + 5)
+            threshold = min(255, threshold + 5)
             print(f"[tracker] Threshold = {threshold}")
         elif key == ord('d'):
             areas = sorted([cv2.contourArea(c) for c in contours], reverse=True)
