@@ -10,17 +10,8 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-echo [setup] Checking and installing packages...
+echo [setup] Installing packages...
 pip install ultralytics pyrealsense2 python-osc opencv-python numpy openni --quiet
-if errorlevel 1 (
-    echo [ERROR] Install failed - trying one by one...
-    pip install ultralytics
-    pip install pyrealsense2
-    pip install python-osc
-    pip install opencv-python
-    pip install numpy
-    pip install openni
-)
 echo [setup] Done
 
 :menu
@@ -28,14 +19,14 @@ echo.
 echo ====================================================
 echo  Select tracker:
 echo ====================================================
-echo  1. Wrist Tracker   (hand hover for level select) OSC port 7000
-echo  2. Top-Down Tracker (person position tracking)   OSC port 7001
-echo  3. Both trackers   (run simultaneously)
+echo  1. Combined Tracker  (zone + wrist, 1 camera)  OSC port 7000
+echo  2. Zone Only Tracker (floor/wall zones only)    OSC port 7001
+echo  3. Wrist Only Tracker (hand tracking only)      OSC port 7000
 echo ====================================================
 set /p choice="Enter [1/2/3]: "
 
 if "%choice%"=="1" (
-    python yolo_tracker.py
+    python combined_tracker.py
     goto end
 )
 if "%choice%"=="2" (
@@ -43,8 +34,7 @@ if "%choice%"=="2" (
     goto end
 )
 if "%choice%"=="3" (
-    start "Wrist Tracker" cmd /k python yolo_tracker.py
-    python topdown_tracker.py
+    python yolo_tracker.py
     goto end
 )
 echo Invalid — please enter 1, 2 or 3
