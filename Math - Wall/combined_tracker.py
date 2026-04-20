@@ -31,8 +31,8 @@ OSC_PORT  = 7000
 MODEL_NAME     = "yolov8n-pose.pt"
 CONF_THRESH    = 0.4
 INFER_EVERY    = 2
-JUMP_THRESHOLD   = 0.06
-JUMP_VEL_THRESH  = 0.02
+JUMP_THRESHOLD   = 0.10  # ต้องสูงกว่า baseline มากพอ
+JUMP_VEL_THRESH  = 0.03  # ต้องเคลื่อนที่เร็วพอ
 NOSE_SMOOTH      = 0.15
 JUMP_HOLD_FRAMES = 6
 
@@ -370,7 +370,8 @@ def main():
                 jump_diff = nose_smooth - nose_baseline
 
                 # กระโดด = velocity สูง หรือ diff สูง
-                raw_jump = nose_vel > JUMP_VEL_THRESH or jump_diff > JUMP_THRESHOLD
+                # ต้องทั้ง velocity สูง AND diff สูง → ป้องกันเดินธรรมดา trigger
+                raw_jump = nose_vel > JUMP_VEL_THRESH and jump_diff > JUMP_THRESHOLD
 
                 # hold active หลาย frame เพื่อให้ TD รับได้แน่นอน
                 if raw_jump:
