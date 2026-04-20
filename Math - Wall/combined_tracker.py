@@ -45,6 +45,16 @@ ROI_Y_END   = 1.0   # ถึงล่างสุด
 
 KP_NOSE = 0
 
+# Answer zones - ซ้าย=A, ขวา=B (ใช้ตอนเล่นเกม)
+ANSWER_ZONES = {
+    'a': (0.00, 0.00, 0.50, 1.00),  # ซ้าย
+    'b': (0.50, 0.00, 1.00, 1.00),  # ขวา
+}
+ANSWER_COLORS = {
+    'a': (0,   200, 100),
+    'b': (200, 100,   0),
+}
+
 DEFAULT_ZONES = {
     1: (0.00, 0.00, 0.33, 1.00),
     2: (0.33, 0.00, 0.67, 1.00),
@@ -413,6 +423,15 @@ def main():
         osc.send_message("/persons/count", len(valid_blobs))
         for zid in [1, 2, 3]:
             osc.send_message(f"/zone/{zid}/active", 1 if zone_hit[zid] else 0)
+
+        # ── answer zone detection (ซ้าย=a, ขวา=b) ────────────────────────────
+        answer_hit = {'a': False, 'b': False}
+        for cx, cy, cnt in valid_blobs:
+            for side, zone in ANSWER_ZONES.items():
+                if blob_in_zone(cx, cy, zone, w, h):
+                    answer_hit[side] = True
+        osc.send_message("/answer/a/active", 1 if answer_hit['a'] else 0)
+        osc.send_message("/answer/b/active", 1 if answer_hit['b'] else 0)
 
         # ── draw zones ─────────────────────────────────────────────────────────
         for zid, zone in DEFAULT_ZONES.items():
