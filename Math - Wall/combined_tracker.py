@@ -309,8 +309,10 @@ def main():
     threshold     = BG_THRESHOLD
     frame_count   = 0
     last_results  = []
-    nose_baseline = None
-    nose_smooth   = 0.0
+    nose_baseline    = None
+    nose_smooth      = 0.0
+    nose_prev        = 0.0
+    jump_hold_count  = 0   # นับ frame ที่ค้าง active
 
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,  7))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
@@ -351,15 +353,30 @@ def main():
                 ny_nose = -(pk[KP_NOSE][1] / h) + 0.5
                 nose_smooth = nose_smooth * NOSE_SMOOTH + ny_nose * (1 - NOSE_SMOOTH)
 
+                # velocity = how fast nose is moving up this frame
+                nose_vel = nose_smooth - nose_prev
+                nose_prev = nose_smooth
+
+                # calibrate baseline ช้าๆ เฉพาะตอนไม่กระโดด
                 if nose_baseline is None:
                     nose_baseline = nose_smooth
                 else:
                     diff = nose_smooth - nose_baseline
                     if diff < JUMP_THRESHOLD:
-                        nose_baseline = nose_baseline * 0.99 + nose_smooth * 0.01
+                        nose_baseline = nose_baseline * 0.995 + nose_smooth * 0.005
 
                 jump_diff = nose_smooth - nose_baseline
-                jump_detected = jump_diff > JUMP_THRESHOLD
+
+                # กระโดด = velocity สูง หรือ diff สูง
+                raw_jump = nose_vel > JUMP_VEL_THRESH or jump_diff > JUMP_THRESHOLD
+
+                # hold active หลาย frame เพื่อให้ TD รับได้แน่นอน
+                if raw_jump:
+                    jump_hold_count = JUMP_HOLD_FRAMES
+                elif jump_hold_count > 0:
+                    jump_hold_count -= 1
+
+                jump_detected = jump_hold_count > 0
 
                 osc.send_message("/jump/active", 1 if jump_detected else 0)
                 osc.send_message("/jump/y",      float(jump_diff))
@@ -367,7 +384,7 @@ def main():
                 col_nose = (0, 255, 0) if jump_detected else (200, 200, 200)
                 cv2.circle(display, (int(pk[KP_NOSE][0]), int(pk[KP_NOSE][1])), 10, col_nose, -1)
                 cv2.putText(display,
-                            f"JUMP! +{jump_diff:.2f}" if jump_detected else f"y={jump_diff:+.2f}",
+                            f"JUMP! v={nose_vel:.3f}" if jump_detected else f"y={jump_diff:+.2f} v={nose_vel:+.3f}",
                             (int(pk[KP_NOSE][0])+14, int(pk[KP_NOSE][1])),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, col_nose, 2)
             else:
@@ -466,9 +483,11 @@ def main():
         elif key == ord('r'):
             static_bg     = None
             nose_baseline = None
+            nose_prev     = 0.0
             print("[tracker] Reset BG + baseline")
         elif key == ord('b'):
             nose_baseline = None
+            nose_prev     = 0.0
             print("[tracker] Baseline RESET - stand still for 2 seconds")
         elif key in (ord('+'), ord('=')):
             threshold = max(5, threshold - 5)
